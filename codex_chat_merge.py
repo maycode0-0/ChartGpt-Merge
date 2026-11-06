@@ -952,11 +952,47 @@ def merge_global(base, incoming, chosen, maps, host_map):
     return {k: v for k, v in result.items() if k in CHAT_KEYS}
 
 
+def check_app_catalog_schema(dst, src, filename):
+    dst_objects, dst_migrations = schema(dst)
+    src_objects, src_migrations = schema(src)
+    dst_ddl, src_ddl = ({(kind, name): (table, sql) for kind, name, table, sql in objects}
+                        for objects in (dst_objects, src_objects))
+
+    # These two migrations only affect runtime state and automations. The merge
+    # retains the target's tables and migration history without importing either.
+    active_turns = ("table", "active_chat_turns")
+    if active_turns not in dst_ddl or active_turns not in src_ddl:
+        dst_ddl.pop(active_turns, None)
+        src_ddl.pop(active_turns, None)
+    automations = ("table", "automations")
+    suffix = ", remote_host TEXT)"
+    for ddl in (dst_ddl, src_ddl):
+        if automations in ddl:
+            table, sql = ddl[automations]
+            if sql.endswith(suffix):
+                ddl[automations] = (table, sql.removesuffix(suffix) + ")")
+
+    dst_steps, src_steps = ({row[0]: row for row in migrations}
+                            for migrations in (dst_migrations, src_migrations))
+    optional_steps = {"20261028065000_create_active_chat_turns", "20261029223800_add_automation_remote_host"}
+    optional_absences = optional_steps & (dst_steps.keys() ^ src_steps.keys())
+    ddl_diff = sorted({name for kind, name in dst_ddl.keys() | src_ddl.keys()
+                       if dst_ddl.get((kind, name)) != src_ddl.get((kind, name))})
+    step_diff = sorted(str(step) for step in (dst_steps.keys() | src_steps.keys()) - optional_absences
+                       if dst_steps.get(step) != src_steps.get(step))
+    details = []
+    if ddl_diff:
+        details.append("结构差异：" + "、".join(ddl_diff))
+    if step_diff:
+        details.append("迁移记录差异：" + "、".join(step_diff))
+    if details:
+        raise MergeError(f"应用索引数据库结构不兼容（{filename}）；" + "；".join(details))
+
+
 def merge_app_catalog(dst_path, src_path, chosen, maps, path_mappings=None):
     host_map = {}
     with database(dst_path, True) as dst, database(src_path) as src:
-        if schema(dst) != schema(src):
-            raise MergeError("应用索引数据库版本不一致，请将两边 Codex 更新到相同版本后重新导出")
+        check_app_catalog_schema(dst, src, dst_path.name)
         required = {"local_thread_catalog", "local_thread_catalog_hosts", "thread_timeline_ledger"}
         if not required <= tables(dst):
             raise MergeError("尚未支持的应用聊天索引格式")

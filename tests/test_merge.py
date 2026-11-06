@@ -186,6 +186,41 @@ class MergeTests(unittest.TestCase):
             self.merge(self.export(self.a, "a"), self.export(self.b, "b"))
         self.assertFalse((self.root / "job").exists())
 
+    def test_known_app_migrations_do_not_prevent_merge_or_change_target_schema(self):
+        app = "sqlite/codex.db"
+        make_home(self.a, {"a": ["older schema"]})
+        make_home(self.b, {"b": ["newer schema"]}, local_host="local-b")
+        with m.database(self.a / app, True) as c:
+            c.execute("DROP TABLE active_chat_turns")
+        with m.database(self.b / app, True) as c:
+            c.execute("ALTER TABLE automations ADD COLUMN remote_host TEXT")
+            c.execute("UPDATE automations SET remote_host='local-only-host'")
+            c.execute("INSERT INTO active_chat_turns VALUES ('profile','account','user','b','launch',1)")
+            c.executemany("INSERT INTO codex_schema_migrations (id,checksum,applied_at) VALUES (?,'sample',1)", [
+                ("20261028065000_create_active_chat_turns",),
+                ("20261029223800_add_automation_remote_host",)])
+        old, new = self.export(self.a, "old"), self.export(self.b, "new")
+        for target, source in ((old, new), (new, old)):
+            with self.subTest(target=target.name):
+                result = m.merge_snapshots(target, source, self.root / ("job-" + target.name), log=quiet)
+                self.assertEqual(self.read_ids(result), {"a", "b"})
+                with m.database(result / app) as c, m.database(target / app) as original:
+                    self.assertEqual(m.schema(c), m.schema(original))
+                    for table in ("active_chat_turns", "automations"):
+                        if table in m.tables(original):
+                            self.assertEqual(m.rows(c, table), m.rows(original, table))
+                    self.assertEqual({r[0] for r in c.execute("SELECT thread_id FROM local_thread_catalog")}, {"a", "b"})
+
+    def test_unknown_app_drift_reports_database_table_and_migration(self):
+        make_home(self.a, {"a": ["first"]})
+        make_home(self.b, {"b": ["second"]})
+        with m.database(self.b / "sqlite/codex.db", True) as c:
+            c.execute("ALTER TABLE local_thread_catalog ADD COLUMN future_field TEXT")
+            c.execute("INSERT INTO codex_schema_migrations (id,checksum,applied_at) VALUES ('future_step','sample',1)")
+        with self.assertRaisesRegex(m.MergeError, r"codex\.db.*local_thread_catalog.*future_step"):
+            self.merge(self.export(self.a, "a"), self.export(self.b, "b"))
+        self.assertFalse((self.root / "job/merged/manifest.json").exists())
+
     def test_stale_local_database_rejected(self):
         make_home(self.a, {"a": ["甲"]})
         make_home(self.b, {"b": ["乙"]})
