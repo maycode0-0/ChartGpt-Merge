@@ -12,6 +12,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.parse
 import uuid
 import zipfile
@@ -51,9 +52,11 @@ def load_settings(path=None):
     hostname = re.sub(r"[^A-Za-z0-9_-]", "-", socket.gethostname()).strip("-_")[:32] or "pc"
     defaults = {"owner_id": owner, "device": hostname + "-" + owner[:8],
                 "url": "", "repo": str(Path.home() / "CodexChatBackups" / "git-repo"),
-                "encrypt": True, "gui": {}}
+                "encrypt": True, "network_timeout": 1800, "gui": {}}
     result = {k: existing[k] if isinstance(existing.get(k), type(v)) else v for k, v in defaults.items()}
     result["owner_id"] = owner
+    if not 60 <= result["network_timeout"] <= 7200:
+        result["network_timeout"] = 1800
     result["gui"] = gui_settings(result["gui"])
     return result
 
@@ -64,7 +67,8 @@ def gui_settings(value):
         return {}
     result = {k: value[k] for k in ("home", "incoming", "work", "result", "selection_home")
               if isinstance(value.get(k), str)}
-    for key, options in (("conflict", {"stop", "base", "incoming"}), ("scope", {"all", "selected"})):
+    for key, options in (("conflict", {"stop", "base", "incoming"}), ("scope", {"all", "selected"}),
+                         ("page", {"git", "local", "settings"})):
         if isinstance(value.get(key), str) and value[key] in options:
             result[key] = value[key]
     for key in ("project_ids", "thread_ids"):
@@ -269,25 +273,41 @@ def unpack_snapshot(directory, output, password=None, log=print):
 
 
 class GitStore:
-    def __init__(self, url, repo, device, owner_id, log=print):
+    def __init__(self, url, repo, device, owner_id, log=print, *, network_timeout=1800):
         self.url = validate_url(url.strip())
         self.repo = Path(repo).resolve()
         self.device = identifier(device)
         self.owner_id = str(uuid.UUID(owner_id))
         self.log = log
+        self.network_timeout = int(network_timeout)
+        if not 60 <= self.network_timeout <= 7200:
+            raise core.MergeError("网络超时应为 1 至 120 分钟")
 
     def git(self, *args, check=True, cwd=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-        env.update(GIT_TERMINAL_PROMPT="0", GIT_SSH_COMMAND="ssh -o BatchMode=yes", LC_ALL="C")
+        # Honor the same SSH and credential configuration as terminal Git.
+        for key in ("GIT_SSH", "GIT_SSH_COMMAND", "GIT_SSH_VARIANT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        env.update(GIT_TERMINAL_PROMPT="0", LC_ALL="C")
         command = ["git", "-c", "core.hooksPath=" + os.devnull, *args]
+        network = bool(args and args[0] in {"clone", "fetch", "push"})
+        timeout = self.network_timeout if network else 300
+        if network:
+            self.log(f"Git {args[0]}：正在传输，单次最长等待 {timeout // 60} 分钟……")
+        started = time.monotonic()
         try:
             p = subprocess.run(command, cwd=str(cwd or self.repo), env=env, capture_output=True,
-                               encoding="utf-8", errors="replace", timeout=300,
+                               encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL,
                                creationflags=0x08000000 if os.name == "nt" else 0)
         except FileNotFoundError as e:
             raise core.MergeError("找不到 Git，请先安装 Git for Windows") from e
         except subprocess.TimeoutExpired as e:
-            raise core.MergeError("Git 操作超时，请检查网络和登录后重试；本地快照保留") from e
+            operation = args[0] if args else "操作"
+            hint = "已提交的分卷保留，可点击「仅重试推送」，无需重新导出。" if operation == "push" else "请检查网络及 Git 登录后重试。"
+            raise core.MergeError(f"Git {operation} 超时（{timeout // 60} 分钟）。{hint}\n可在连接与设置中调整网络超时。") from e
+        if network:
+            self.log(f"Git {args[0]} {'完成' if p.returncode == 0 else '失败'}，用时 {time.monotonic() - started:.1f} 秒。")
         if check and p.returncode:
             detail = (p.stderr or p.stdout).strip()[-2500:]
             raise core.MergeError("Git 操作未完成：" + detail + "\n请确认仓库权限，并使用 Git 凭据管理器或 SSH 登录。")
@@ -383,13 +403,16 @@ class GitStore:
         self.marker()
         self.clean()
 
-    def _rebase_pending(self, remote):
-        commits = self.git("rev-list", remote + "..HEAD").stdout.splitlines()
+    def _validate_pending(self, revision):
+        commits = self.git("rev-list", revision).stdout.splitlines()
         allowed_prefixes = ("snapshots/" + self.device + "/", "devices/" + self.device + "/")
         for commit in commits:
             changed = self.git("diff-tree", "--root", "--no-commit-id", "--name-only", "-r", commit).stdout.splitlines()
             if any(not p.startswith(allowed_prefixes) and p not in {MARKER, ".gitattributes"} for p in changed):
-                raise core.MergeError("仓库已分叉且本地含其他文件的提交，请手动处理；不会强制推送")
+                raise core.MergeError("待推送历史中含其他文件的提交，请手动处理；工具只重放和推送本机的聊天备份")
+
+    def _rebase_pending(self, remote):
+        self._validate_pending(remote + "..HEAD")
         self.git("update-ref", "refs/codex-chat-backups/" + core.stamp(), "HEAD")
         self.log("其他电脑已有新提交，正在重放本机快照提交……")
         result = self.git("-c", "rebase.autoStash=false", "-c", "user.name=Codex Chat Backup",
@@ -402,6 +425,11 @@ class GitStore:
     def connect(self):
         with self.locked():
             self._sync()
+            return self._list_latest()
+
+    def local_snapshots(self):
+        """Read the synchronized catalog after a successful push, without fetching again."""
+        with self.locked():
             return self._list_latest()
 
     def _list_latest(self):
@@ -425,6 +453,9 @@ class GitStore:
         # Dedicated backup commits use a local fallback author without altering global config.
         self.git("-c", "user.name=Codex Chat Backup", "-c", "user.email=codex-chat-backup@localhost",
                  "-c", "commit.gpgSign=false", "commit", "-m", message)
+        self._push_pending()
+
+    def _push_pending(self):
         for attempt in range(3):
             result = self.git("push", "--set-upstream", "origin", "HEAD", check=False)
             if not result.returncode:
@@ -438,6 +469,23 @@ class GitStore:
                 break  # This is authentication/network/quota failure, not a competing push.
             self._rebase_pending(remote)
         raise core.MergeError("推送未完成。提交和快照保留在本机，下次连接后可重试。\n" + (result.stderr or result.stdout)[-2000:])
+
+    def retry_push(self):
+        """Publish retained commits without exporting, packing, or creating a commit."""
+        with self.locked():
+            self._sync()
+            if not self.marker():
+                raise core.MergeError("此仓库还没有聊天备份，请先备份并上传")
+            device_file = self.safe_repo_path(f"devices/{self.device}/device.json")
+            if not device_file.exists() or core.read_json(device_file).get("owner_id") != self.owner_id:
+                raise core.MergeError("没有属于本机的待推送备份，请核对设备标识")
+            remote = "refs/remotes/origin/" + self.branch()
+            exists = self.git("rev-parse", "--verify", remote, check=False).returncode == 0
+            self._validate_pending(remote + "..HEAD" if exists else "HEAD")
+            self.log("重试推送已提交的备份；不重新导出或加密……")
+            self._push_pending()
+            self.log("推送完成，远端已更新。")
+            return self._list_latest()
 
     def upload_snapshot(self, snapshot, password=None):
         snapshot = Path(snapshot).resolve()

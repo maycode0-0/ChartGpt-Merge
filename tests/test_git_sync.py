@@ -61,6 +61,8 @@ class GitSyncTests(unittest.TestCase):
         office = self.store()
         self.assertEqual(office.connect(), [])
         first = office.upload_snapshot(self.snapshot)
+        with mock.patch.object(office, "git", side_effect=AssertionError("catalog refresh must not contact Git")):
+            self.assertEqual(office.local_snapshots()[0]["snapshot_id"], first["snapshot_id"])
         home = self.store("home", "home-clone", str(uuid.uuid4()))
         listed = home.connect()
         self.assertEqual([(i["device"], i["snapshot_id"]) for i in listed], [("office", first["snapshot_id"])])
@@ -132,9 +134,43 @@ class GitSyncTests(unittest.TestCase):
                 office.upload_snapshot(self.snapshot)
         self.assertEqual(office.git("status", "--porcelain").stdout.strip(), "")
         self.assertEqual(office.git("rev-parse", "--verify", "HEAD").returncode, 0)
-        office.upload_snapshot(self.snapshot)
+        committed = office.git("rev-parse", "HEAD").stdout.strip()
+        snapshots = sorted((office.repo / "snapshots" / "office").iterdir())
+        with mock.patch.object(sync, "pack_snapshot", side_effect=AssertionError("retry must not repack")):
+            office.retry_push()
+        self.assertEqual(office.git("rev-parse", "HEAD").stdout.strip(), committed)
+        self.assertEqual(sorted((office.repo / "snapshots" / "office").iterdir()), snapshots)
         home = self.store("home", "home-clone", str(uuid.uuid4()))
         self.assertEqual(len(home.connect()), 1)
+
+    def test_retry_push_rejects_unrelated_local_commits(self):
+        office = self.store()
+        office.upload_snapshot(self.snapshot)
+        (office.repo / "notes.txt").write_text("unrelated", encoding="utf-8")
+        office.git("add", "notes.txt")
+        office.git("-c", "user.name=Test", "-c", "user.email=test@localhost", "-c", "commit.gpgSign=false", "commit", "-m", "Unrelated work")
+        with mock.patch.object(office, "_push_pending") as push:
+            with self.assertRaises(core.MergeError):
+                office.retry_push()
+            push.assert_not_called()
+
+    def test_retry_push_rebases_another_device_without_repacking(self):
+        office = self.store()
+        office.upload_snapshot(self.snapshot)
+        home = self.store("home", "home-clone", str(uuid.uuid4()))
+        home.connect()
+        original = home.git
+        def fail_push(*args, **kwargs):
+            if args and args[0] == "push":
+                return subprocess.CompletedProcess(args, 1, "", "offline")
+            return original(*args, **kwargs)
+        with mock.patch.object(home, "git", side_effect=fail_push):
+            with self.assertRaises(core.MergeError):
+                home.upload_snapshot(self.snapshot)
+        office.upload_snapshot(self.snapshot)
+        with mock.patch.object(sync, "pack_snapshot", side_effect=AssertionError("must not repack")):
+            home.retry_push()
+        self.assertEqual({x["device"] for x in office.connect()}, {"office", "home"})
 
     def test_concurrent_pushes_rebase_separate_device_commits(self):
         office = self.store()

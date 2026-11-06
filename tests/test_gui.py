@@ -27,11 +27,11 @@ class GuiTests(unittest.TestCase):
                 widgets = list(descendants(root))
                 tabs = [w for w in widgets if isinstance(w, ttk.Notebook)]
                 self.assertEqual(len(tabs), 1)
-                self.assertEqual(len(tabs[0].tabs()), 2)
+                self.assertEqual(len(tabs[0].tabs()), 3)
                 labels = {str(w.cget("text")) for w in widgets if isinstance(w, (ttk.Label, ttk.Button))}
-                self.assertTrue({"仓库地址", "连接 / 拉取", "导出并推送", "拉取并合并"} <= labels)
+                self.assertTrue({"仓库地址", "备份并上传", "仅重试推送", "下载并预览合并"} <= labels)
                 self.assertTrue({"读取 / 刷新项目", "全选项目", "清空选择"} <= labels)
-                self.assertEqual(len([w for w in widgets if isinstance(w, ttk.Treeview)]), 1)
+                self.assertEqual(len([w for w in widgets if isinstance(w, ttk.Treeview)]), 2)
                 passwords = [w for w in widgets if isinstance(w, ttk.Entry) and str(w.cget("show")) == "*"]
                 self.assertEqual(len(passwords), 1)
             except Exception as e:
