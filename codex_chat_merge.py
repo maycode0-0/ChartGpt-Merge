@@ -1341,26 +1341,25 @@ def gui():
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
     import git_chat_sync as sync
+    git_settings = sync.load_settings()
+    saved_gui = git_settings.get("gui", {})
     root = tk.Tk()
     root.title("Codex 聊天合并工具")
     root.geometry("940x800")
-    root.minsize(820, 680)
-    outer = ttk.Frame(root, padding=18)
+    root.minsize(820, 800)
+    outer = ttk.Frame(root, padding=12)
     outer.pack(fill="both", expand=True)
     ttk.Label(outer, text="Codex 聊天合并", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
     ttk.Label(outer, text="请先完全退出 Codex / ChatGPT。不同聊天合并；同一聊天分叉时需选择保留显示的版本。",
               wraplength=810).pack(anchor="w", pady=(8, 12))
     tabs = ttk.Notebook(outer)
-    tabs.pack(fill="x", pady=(0, 6))
+    tabs.pack(fill="both", expand=True, pady=(0, 6))
     local_tab = ttk.Frame(tabs, padding=12)
     git_tab = ttk.Frame(tabs, padding=12)
     tabs.add(local_tab, text="本地导出 / 合并")
     tabs.add(git_tab, text="Git 仓库同步")
-    scope_tab = ttk.Frame(tabs, padding=12)
-    tabs.add(scope_tab, text="导出范围（按项目）")
-    scope = tk.StringVar(value="all")
+    scope = tk.StringVar(value=saved_gui.get("scope", "all"))
     scope_summary = tk.StringVar(value="导出范围：全部聊天")
-    ttk.Label(outer, textvariable=scope_summary).pack(before=tabs, anchor="w", pady=(0, 6))
     values = {}
     defaults = {"home": str(Path.home() / ".codex"), "incoming": "",
                 "work": str(Path.home() / "CodexChatBackups"), "result": ""}
@@ -1369,7 +1368,7 @@ def gui():
         line = ttk.Frame(local_tab)
         line.pack(fill="x", pady=4)
         ttk.Label(line, text=labels[key], width=25).pack(side="left")
-        v = tk.StringVar(value=defaults[key])
+        v = tk.StringVar(value=saved_gui.get(key, defaults[key]))
         values[key] = v
         ttk.Entry(line, textvariable=v).pack(side="left", fill="x", expand=True)
         def browse(variable=v):
@@ -1377,7 +1376,7 @@ def gui():
             if p:
                 variable.set(p)
         ttk.Button(line, text="选择", command=browse).pack(side="left", padx=(6, 0))
-    choice = tk.StringVar(value="stop")
+    choice = tk.StringVar(value=saved_gui.get("conflict", "stop"))
     line = ttk.Frame(local_tab)
     line.pack(fill="x", pady=10)
     ttk.Label(line, text="同一聊天分叉时：").pack(side="left")
@@ -1389,7 +1388,7 @@ def gui():
     controls.pack(fill="x")
     progress = ttk.Progressbar(outer, mode="indeterminate")
     progress.pack(fill="x", pady=(8, 0))
-    text = tk.Text(outer, height=14, wrap="word", state="disabled")
+    text = tk.Text(outer, height=4, wrap="word", state="disabled")
     text.pack(fill="both", expand=True, pady=(12, 0))
     events = queue.Queue()
     busy = [False]
@@ -1446,13 +1445,17 @@ def gui():
         b = ttk.Button(controls, text=label, command=command)
         b.pack(side="left", padx=(0, 8))
         buttons.append(b)
-    scope_data = {"home": None, "groups": [], "nodes": {}}
-    checked_threads, checked_projects = set(), set()
+    scope_tab = ttk.LabelFrame(local_tab, text="导出范围（按项目）", padding=8)
+    scope_tab.pack(fill="both", expand=True, pady=(12, 0))
+    scope_data = {"home": saved_gui.get("selection_home"), "groups": [], "nodes": {}, "loaded": False}
+    checked_threads = set(saved_gui.get("thread_ids", []))
+    checked_projects = set(saved_gui.get("project_ids", []))
     scope_controls = ttk.Frame(scope_tab)
     scope_controls.pack(fill="x", pady=(0, 8))
     def scope_status():
         scope_summary.set("导出范围：全部聊天" if scope.get() == "all" else
                           f"导出范围：已选 {len(checked_threads)} 条聊天、{len(checked_projects)} 个完整项目（仅影响导出 / 推送）")
+        schedule_save()
     ttk.Radiobutton(scope_controls, text="全部聊天", variable=scope, value="all", command=scope_status).pack(side="left")
     ttk.Radiobutton(scope_controls, text="按项目 / 聊天选择", variable=scope, value="selected", command=scope_status).pack(side="left", padx=8)
     def refresh_projects():
@@ -1469,7 +1472,7 @@ def gui():
               wraplength=830).pack(anchor="w", pady=(0, 8))
     tree_frame = ttk.Frame(scope_tab)
     tree_frame.pack(fill="both", expand=True)
-    project_tree = ttk.Treeview(tree_frame, columns=("count", "method"), show="tree headings", height=11)
+    project_tree = ttk.Treeview(tree_frame, columns=("count", "method"), show="tree headings", height=5)
     project_tree.heading("#0", text="项目 / 聊天（点击勾选）")
     project_tree.heading("count", text="聊天数 / 状态")
     project_tree.heading("method", text="归属方式 / 项目目录")
@@ -1533,10 +1536,11 @@ def gui():
         b.pack(side="left", padx=(0, 8))
         buttons.append(b)
     ttk.Label(line, text="选择仅用于导出与 Git 上传；合并时仍完整保留本机已有项目。").pack(side="left")
+    ttk.Label(scope_tab, textvariable=scope_summary).pack(anchor="w", pady=(6, 0))
     def safe_export_arguments():
         if scope.get() == "all":
             return {}
-        if scope_data["home"] != str(Path(values["home"].get()).resolve()):
+        if not scope_data["loaded"] or scope_data["home"] != str(Path(values["home"].get().strip()).resolve()):
             messagebox.showerror("请读取项目", "请先读取本机项目列表；更改 .codex 目录后需要重新读取")
             return None
         if not checked_threads and not checked_projects:
@@ -1544,9 +1548,10 @@ def gui():
             return None
         covered = {t["id"] for p in scope_data["groups"] if p["id"] in checked_projects for t in p["threads"]}
         return {"project_ids": sorted(checked_projects), "thread_ids": sorted(checked_threads - covered)}
-    git_settings = sync.load_settings()
     git_values = {}
     ttk.Label(git_tab, text="使用独立私有仓库；两台电脑设备标识应不同。登录使用已配置的 Git 凭据管理器或 SSH。",
+              wraplength=820).pack(anchor="w", pady=(0, 8))
+    ttk.Label(git_tab, text="导出范围沿用「本地导出 / 合并」页中的项目选择。",
               wraplength=820).pack(anchor="w", pady=(0, 8))
     for key, label in (("url", "仓库地址"), ("repo", "本地克隆目录"), ("device", "本机设备标识")):
         line = ttk.Frame(git_tab)
@@ -1588,6 +1593,28 @@ def gui():
     def store(cfg):
         sync.save_settings(cfg)
         return sync.GitStore(cfg["url"], cfg["repo"], cfg["device"], cfg["owner_id"], log)
+    pending_save = [None]
+    def save_preferences():
+        if pending_save[0] is not None:
+            root.after_cancel(pending_save[0])
+            pending_save[0] = None
+        cfg = {k: v.get().strip() for k, v in git_values.items()}
+        cfg.update(owner_id=git_settings["owner_id"], encrypt=encrypted.get())
+        cfg["gui"] = dict(capture(), conflict=choice.get(), scope=scope.get(),
+                          selection_home=scope_data["home"] or "",
+                          project_ids=sorted(checked_projects), thread_ids=sorted(checked_threads))
+        try:
+            sync.save_settings(cfg)
+            return True
+        except OSError as e:
+            log("无法保存上次选择：" + str(e))
+            return False
+    def schedule_save(*_):
+        if pending_save[0] is not None:
+            root.after_cancel(pending_save[0])
+        pending_save[0] = root.after(500, save_preferences)
+    for variable in [*values.values(), *git_values.values(), choice, scope, encrypted]:
+        variable.trace_add("write", schedule_save)
     def get_cfg():
         try:
             cfg = git_capture()
@@ -1654,6 +1681,7 @@ def gui():
         b = ttk.Button(git_controls, text=label, command=command)
         b.pack(side="left", padx=(0, 8))
         buttons.append(b)
+    poll_id = [None]
     def poll():
         while not events.empty():
             kind, msg = events.get()
@@ -1662,9 +1690,13 @@ def gui():
             elif kind == "incoming":
                 values["incoming"].set(msg)
             elif kind == "projects":
-                scope_data.update(home=msg["home"], groups=msg["groups"], nodes={})
-                checked_threads.clear()
-                checked_projects.clear()
+                if scope_data["home"] != msg["home"]:
+                    checked_threads.clear()
+                    checked_projects.clear()
+                scope_data.update(home=msg["home"], groups=msg["groups"], nodes={}, loaded=True)
+                checked_projects.intersection_update(p["id"] for p in msg["groups"])
+                checked_threads.intersection_update(t["id"] for p in msg["groups"] for t in p["threads"])
+                checked_threads.update(t["id"] for p in msg["groups"] if p["id"] in checked_projects for t in p["threads"])
                 project_tree.delete(*project_tree.get_children())
                 for number, group in enumerate(msg["groups"]):
                     node = "p" + str(number)
@@ -1677,7 +1709,7 @@ def gui():
                         project_tree.insert(node, "end", iid=tid, text="☐ " + thread["title"],
                                             values=("已归档" if thread["archived"] else "聊天", method))
                         scope_data["nodes"][tid] = ("thread", group, thread)
-                scope_status()
+                render_checks()
             elif kind == "remotes":
                 remote_items.clear()
                 for item in msg:
@@ -1698,14 +1730,21 @@ def gui():
                 text.configure(state="disabled")
                 if kind == "error":
                     messagebox.showerror("操作未完成", msg)
-        root.after(120, poll)
+        poll_id[0] = root.after(120, poll)
     def close():
         if busy[0]:
             messagebox.showinfo("正在处理", "请等待当前操作完成后关闭窗口，避免中断备份或恢复。")
         else:
+            if not save_preferences():
+                messagebox.showwarning("设置未保存", "无法保存本次选择；下次启动将使用原配置。请检查配置目录的写入权限。")
+            if poll_id[0] is not None:
+                root.after_cancel(poll_id[0])
             root.destroy()
     root.protocol("WM_DELETE_WINDOW", close)
-    root.after(120, poll)
+    poll_id[0] = root.after(120, poll)
+    scope_status()
+    if scope.get() == "selected":
+        root.after(150, refresh_projects)
     root.mainloop()
 
 

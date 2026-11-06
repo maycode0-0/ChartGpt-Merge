@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import urllib.parse
 import uuid
 import zipfile
@@ -22,6 +23,7 @@ ARCHIVE_FORMAT = "codex-chat-archive-v1"
 MARKER = ".codex-chat-repo.json"
 PART_SIZE = 48 * 1024 * 1024
 ITERATIONS = 600_000
+_settings_lock = threading.RLock()
 
 
 def identifier(value):
@@ -37,19 +39,53 @@ def settings_path():
 
 def load_settings(path=None):
     path = Path(path or settings_path())
-    existing = core.read_json(path) if path.exists() else {}
-    owner = existing.get("owner_id") or str(uuid.uuid4())
+    try:
+        existing = core.read_json(path) if path.exists() else {}
+    except (ValueError, OSError):
+        existing = {}
+    if not isinstance(existing, dict):
+        existing = {}
+    owner = existing.get("owner_id")
+    if not isinstance(owner, str) or not owner:
+        owner = str(uuid.uuid4())
     hostname = re.sub(r"[^A-Za-z0-9_-]", "-", socket.gethostname()).strip("-_")[:32] or "pc"
     defaults = {"owner_id": owner, "device": hostname + "-" + owner[:8],
                 "url": "", "repo": str(Path.home() / "CodexChatBackups" / "git-repo"),
-                "encrypt": True}
-    return {k: existing.get(k, v) for k, v in defaults.items()}
+                "encrypt": True, "gui": {}}
+    result = {k: existing[k] if isinstance(existing.get(k), type(v)) else v for k, v in defaults.items()}
+    result["owner_id"] = owner
+    result["gui"] = gui_settings(result["gui"])
+    return result
+
+
+def gui_settings(value):
+    """Keep only known preferences; never accept credentials in nested settings."""
+    if not isinstance(value, dict):
+        return {}
+    result = {k: value[k] for k in ("home", "incoming", "work", "result", "selection_home")
+              if isinstance(value.get(k), str)}
+    for key, options in (("conflict", {"stop", "base", "incoming"}), ("scope", {"all", "selected"})):
+        if isinstance(value.get(key), str) and value[key] in options:
+            result[key] = value[key]
+    for key in ("project_ids", "thread_ids"):
+        if isinstance(value.get(key), list):
+            result[key] = sorted({v for v in value[key] if isinstance(v, str)})
+    return result
 
 
 def save_settings(settings, path=None):
     # Explicit allowlist: passwords and credential tokens never enter this file.
-    core.write_json(path or settings_path(), {k: settings[k] for k in
-                    ("owner_id", "device", "url", "repo", "encrypt")})
+    with _settings_lock:
+        merged = load_settings(path)
+        for key in merged:
+            if key in settings:
+                if key == "url" and settings[key]:
+                    try:
+                        validate_url(settings[key])
+                    except core.MergeError:
+                        continue
+                merged[key] = gui_settings(settings[key]) if key == "gui" else settings[key]
+        core.write_json(path or settings_path(), merged)
 
 
 def validate_url(url):

@@ -16,6 +16,7 @@ class GuiTests(unittest.TestCase):
         except tk.TclError as e:
             self.skipTest("No graphical Tk environment: " + str(e))
         root.withdraw()
+        root.update_idletasks()
         errors = []
         def descendants(widget):
             for child in widget.winfo_children():
@@ -26,7 +27,7 @@ class GuiTests(unittest.TestCase):
                 widgets = list(descendants(root))
                 tabs = [w for w in widgets if isinstance(w, ttk.Notebook)]
                 self.assertEqual(len(tabs), 1)
-                self.assertEqual(len(tabs[0].tabs()), 3)
+                self.assertEqual(len(tabs[0].tabs()), 2)
                 labels = {str(w.cget("text")) for w in widgets if isinstance(w, (ttk.Label, ttk.Button))}
                 self.assertTrue({"仓库地址", "连接 / 拉取", "导出并推送", "拉取并合并"} <= labels)
                 self.assertTrue({"读取 / 刷新项目", "全选项目", "清空选择"} <= labels)
@@ -36,10 +37,10 @@ class GuiTests(unittest.TestCase):
             except Exception as e:
                 errors.append(e)
             finally:
-                root.destroy()
+                root.tk.call(root.protocol("WM_DELETE_WINDOW"))
         cfg = {"owner_id": str(uuid.uuid4()), "device": "test-device", "url": "", "repo": "C:/example/repo", "encrypt": True}
         root.after(40, check_and_close)
-        with mock.patch.object(tk, "Tk", return_value=root), mock.patch.object(sync, "load_settings", return_value=cfg):
+        with mock.patch.object(tk, "Tk", return_value=root), mock.patch.object(sync, "load_settings", return_value=cfg), mock.patch.object(sync, "save_settings"):
             core.gui()
         if errors:
             raise errors[0]
