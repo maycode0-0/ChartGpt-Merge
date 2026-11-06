@@ -291,13 +291,103 @@ def load_snapshot(root):
     return manifest
 
 
-def normalized_root(value):
+def project_path_spelling(value):
     value = str(value).replace("/", "\\")
     if value.startswith("\\\\?\\UNC\\"):
         value = "\\\\" + value[8:]
     elif value.startswith("\\\\?\\"):
         value = value[4:]
-    return ntpath.normcase(ntpath.normpath(value))
+    return ntpath.normpath(value)
+
+
+def normalized_root(value):
+    return ntpath.normcase(project_path_spelling(value))
+
+
+def normalize_path_mappings(mapping=None):
+    """Validate absolute directory prefixes; longest source prefix wins once."""
+    if mapping is None:
+        return {}
+    if not isinstance(mapping, dict):
+        raise MergeError("目录映射必须是“来源目录: 本机目录”的 JSON 对象")
+    result, seen = {}, {}
+    for source, target in mapping.items():
+        for value in (source, target):
+            if not isinstance(value, str) or not value.strip() or any(c in value for c in "\r\n\0"):
+                raise MergeError("来源和本机目录都必须填写完整的绝对路径")
+            value = value.strip()
+            if not ((ntpath.isabs(value) and ntpath.splitdrive(value)[0]) or Path(value).is_absolute()):
+                raise MergeError("目录映射不支持相对路径：" + value)
+        source, target = ntpath.normpath(source.strip()), ntpath.normpath(target.strip())
+        key = normalized_root(source)
+        if key in seen:
+            if normalized_root(seen[key]) != normalized_root(target):
+                raise MergeError("同一来源目录不能映射到两个本机目录：" + source)
+            continue
+        seen[key] = target
+        result[source] = target
+    # Identity rules can explicitly exempt a project from a broader parent rule.
+    result = {source: target for source, target in result.items() if normalized_root(source) != normalized_root(target)
+              or any(normalized_root(source).startswith(normalized_root(parent).rstrip("\\") + "\\")
+                     and normalized_root(parent) != normalized_root(destination) for parent, destination in result.items())}
+    return dict(sorted(result.items(), key=lambda item: len(normalized_root(item[0])), reverse=True))
+
+
+def mapped_project_path(value, mappings):
+    if not isinstance(value, str) or not mappings:
+        return value
+    normalized = normalized_root(value)
+    for source, target in mappings.items():
+        prefix = normalized_root(source)
+        if normalized == prefix or normalized.startswith(prefix.rstrip("\\") + "\\"):
+            relative = ntpath.relpath(project_path_spelling(value), project_path_spelling(source))
+            return ntpath.normpath(ntpath.join(target, relative))
+    return value
+
+
+def map_path_values(value, mappings):
+    if isinstance(value, str):
+        return mapped_project_path(value, mappings)
+    if isinstance(value, list):
+        return [map_path_values(v, mappings) for v in value]
+    if isinstance(value, dict):
+        return {mapped_project_path(k, mappings): map_path_values(v, mappings) for k, v in value.items()}
+    return value
+
+
+def map_structured_paths(value, mappings):
+    """Only known path fields in metadata; message bodies and rollout bytes stay intact."""
+    path_keys = {"cwd", "root", "rootPath", "rootPaths", "writable_roots", "writableRoots",
+                 "workspace_roots", "workspaceRoots"}
+    if isinstance(value, dict):
+        return {k: map_path_values(v, mappings) if k in path_keys else map_structured_paths(v, mappings)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [map_structured_paths(v, mappings) for v in value]
+    return value
+
+
+def mapped_global_paths(value, mappings):
+    result = dict(value)
+    if not mappings:
+        return result
+    if "local-projects" in result:
+        result["local-projects"] = map_structured_paths(result["local-projects"], mappings)
+    for key in ("thread-workspace-root-hints", "thread-projectless-output-directories", "thread-writable-roots"):
+        if key in result:
+            result[key] = map_path_values(result[key], mappings)
+    return result
+
+
+def mapped_json_paths(value, mappings):
+    if not value or not mappings:
+        return value
+    try:
+        original = json.loads(value)
+    except (ValueError, TypeError):
+        return value
+    mapped = map_structured_paths(original, mappings)
+    return json.dumps(mapped, ensure_ascii=False) if mapped != original else value
 
 
 def project_catalog(home, *, state_path=None, global_state=None):
@@ -748,20 +838,20 @@ def supported(c, kind):
         raise MergeError("当前工具只支持含 projects / project_roots / thread_sections 的数据库版本")
 
 
-def project_signature(c, row):
+def project_signature(c, row, path_mappings=None):
     roots = [r[0] for r in c.execute("SELECT path FROM project_roots WHERE project_id=? ORDER BY position",
                                    (row["id"],))]
-    return (row["name"], tuple(sorted(ntpath.normcase(ntpath.normpath(x)) for x in roots)))
+    return (row["name"], tuple(sorted({normalized_root(mapped_project_path(x, path_mappings)) for x in roots})))
 
 
-def merge_groups(dst, src, report):
+def merge_groups(dst, src, report, path_mappings=None):
     maps = {"projects": {}, "thread_sections": {}}
     for table in maps:
         existing = {r["id"]: r for r in rows(dst, table)}
         for row in rows(src, table):
             old = row["id"]
             if table == "projects":
-                sig = project_signature(src, row)
+                sig = project_signature(src, row, path_mappings)
                 matches = [k for k, v in existing.items() if project_signature(dst, v) == sig]
                 # Rootless projects with identical names may still be distinct.
                 if not sig[1]:
@@ -773,13 +863,21 @@ def merge_groups(dst, src, report):
             else:
                 new = old
                 if old in existing:
-                    new = str(uuid.uuid5(uuid.NAMESPACE_URL, "codex-chat-merge:" + table + repr(row)))
+                    identity = (row, sig) if table == "projects" else row
+                    new = str(uuid.uuid5(uuid.NAMESPACE_URL, "codex-chat-merge:" + table + repr(identity)))
                 row = dict(row, id=new)
+                if table == "projects":
+                    row["metadata"] = mapped_json_paths(row["metadata"], path_mappings)
                 if new not in existing:
                     insert(dst, table, row)
                     existing[new] = row
                     if table == "projects":
+                        kept_roots = set()
                         for root in rows(src, "project_roots", " WHERE project_id=?", (old,)):
+                            root["path"] = mapped_project_path(root["path"], path_mappings)
+                            if normalized_root(root["path"]) in kept_roots:
+                                continue
+                            kept_roots.add(normalized_root(root["path"]))
                             insert(dst, "project_roots", dict(root, project_id=new))
             maps[table][old] = new
         report[table + "_mapped"] = sum(k != v for k, v in maps[table].items())
@@ -819,7 +917,8 @@ def merge_global(base, incoming, chosen, maps, host_map):
         raise MergeError("尚未支持的 local-projects 数据格式")
     for key, p in ip.items():
         matches = [k for k, b in bp.items() if b.get("name") == p.get("name")
-                   and b.get("rootPaths") == p.get("rootPaths") and b.get("rootPaths")]
+                   and sorted(normalized_root(x) for x in (b.get("rootPaths") or [])) ==
+                       sorted(normalized_root(x) for x in (p.get("rootPaths") or [])) and b.get("rootPaths")]
         if matches:
             mapping[key] = key if key in matches else sorted(matches)[0]
         elif key in bp and bp[key] != p:
@@ -827,6 +926,15 @@ def merge_global(base, incoming, chosen, maps, host_map):
     mapping.update(host_map)
     incoming = remap(incoming, mapping)
     result = union(base, incoming)
+    for project in result.get("local-projects", {}).values():
+        if isinstance(project.get("rootPaths"), list):
+            seen = set()
+            roots = []
+            for root in project["rootPaths"]:
+                if normalized_root(root) not in seen:
+                    seen.add(normalized_root(root))
+                    roots.append(root)
+            project["rootPaths"] = roots
     for k in ("thread-project-assignments", "thread-workspace-root-hints",
               "thread-projectless-output-directories", "thread-writable-roots",
               "thread-project-membership-host-ids", "electron-thread-read-state-v1"):
@@ -842,7 +950,7 @@ def merge_global(base, incoming, chosen, maps, host_map):
     return {k: v for k, v in result.items() if k in CHAT_KEYS}
 
 
-def merge_app_catalog(dst_path, src_path, chosen, maps):
+def merge_app_catalog(dst_path, src_path, chosen, maps, path_mappings=None):
     host_map = {}
     with database(dst_path, True) as dst, database(src_path) as src:
         if schema(dst) != schema(src):
@@ -869,6 +977,8 @@ def merge_app_catalog(dst_path, src_path, chosen, maps):
                 dst.execute("DELETE FROM " + q(t) + " WHERE host_id=? AND thread_id=?", (bh[0], tid))
                 for row in rows(src, t, " WHERE host_id=? AND thread_id=?", (ih[0], tid)):
                     row["host_id"] = bh[0]
+                    if "cwd" in row:
+                        row["cwd"] = mapped_project_path(row["cwd"], path_mappings)
                     if row.get("project_id"):
                         row["project_id"] = maps["projects"].get(row["project_id"], row["project_id"])
                     insert(dst, t, row)
@@ -910,7 +1020,8 @@ def validate_rollout(path, thread_id, history):
             raise MergeError(f"聊天历史与会话文件读取位置不匹配：{thread_id}")
 
 
-def merge_snapshots(base, incoming, output, target_home=None, conflict="stop", log=print):
+def merge_snapshots(base, incoming, output, target_home=None, conflict="stop", log=print, *, path_mappings=None):
+    path_mappings = normalize_path_mappings(path_mappings)
     base, incoming, output = map(lambda p: Path(p).resolve(), (base, incoming, output))
     for p in (base, incoming):
         disjoint(p, output)
@@ -934,6 +1045,7 @@ def merge_snapshots(base, incoming, output, target_home=None, conflict="stop", l
             supported(b, "state" if rel == state else "history")
     output.mkdir(parents=True)
     report = {"status": "planning", "target_home": target_home, "conflict_policy": conflict,
+              "path_mappings": path_mappings,
               "new_threads": [], "updated_threads": [], "kept_threads": [], "conflicts": [],
               "database_only_threads": [], "index_only_threads": [],
               "warnings": ["只迁移本地聊天；不抓取 ChatGPT 云端记录。",
@@ -1000,9 +1112,11 @@ def merge_snapshots(base, incoming, output, target_home=None, conflict="stop", l
     paths = set(bm["files"])
     log(f"导入 {len(chosen)} 个新增或更新的聊天索引和项目关联……")
     with database(result / state, True) as dst, database(incoming / state) as src:
-        maps = merge_groups(dst, src, report)
+        maps = merge_groups(dst, src, report, path_mappings)
         for tid in chosen:
             row = dict(ir[tid])
+            row["cwd"] = mapped_project_path(row["cwd"], path_mappings)
+            row["sandbox_policy"] = mapped_json_paths(row.get("sandbox_policy"), path_mappings)
             row["project_id"] = maps["projects"].get(row.get("project_id"), row.get("project_id"))
             row["thread_section_id"] = maps["thread_sections"].get(row.get("thread_section_id"), row.get("thread_section_id"))
             row["rollout_path"] = str(Path(target_home).joinpath(*PurePosixPath(rels[tid]).parts))
@@ -1081,8 +1195,8 @@ def merge_snapshots(base, incoming, output, target_home=None, conflict="stop", l
         if (rel in bm["files"]) != (rel in im["files"]):
             raise MergeError("两边应用数据库清单不同，请使用相同版本和安装渠道导出")
         if rel in bm["files"]:
-            host_map.update(merge_app_catalog(result / rel, incoming / rel, chosen, maps))
-    write_json(result / GLOBAL, merge_global(read_json(base / GLOBAL), read_json(incoming / GLOBAL),
+            host_map.update(merge_app_catalog(result / rel, incoming / rel, chosen, maps, path_mappings))
+    write_json(result / GLOBAL, merge_global(read_json(base / GLOBAL), mapped_global_paths(read_json(incoming / GLOBAL), path_mappings),
                                            chosen, maps, host_map))
     # Rebuild the small title index from the authoritative merged state, not by line concatenation.
     write_title_index(result / state, result / INDEX)
@@ -1358,6 +1472,7 @@ def main(argv=None):
     merge.add_argument("--out", required=True)
     merge.add_argument("--target-home")
     merge.add_argument("--conflict", choices=["stop", "base", "incoming"], default="stop")
+    merge.add_argument("--path-map", help="目录映射 JSON 文件，内容为 {来源绝对目录: 本机绝对目录}")
     apply = sub.add_parser("apply", help="应用结果；必须保留合并目录旁的 base 目录")
     apply.add_argument("--result", required=True)
     apply.add_argument("--home", default=str(Path.home() / ".codex"))
@@ -1372,7 +1487,8 @@ def main(argv=None):
             for project in project_catalog(args.home):
                 print(f"{project['id']}\t{project['name']}\t{project['count']} 条聊天")
         elif args.command == "merge":
-            merge_snapshots(args.base, args.incoming, args.out, args.target_home, args.conflict)
+            merge_snapshots(args.base, args.incoming, args.out, args.target_home, args.conflict,
+                            path_mappings=read_json(args.path_map) if args.path_map else None)
         elif args.command == "apply":
             apply_result(args.result, args.home, args.backup)
         elif args.command == "rollback":

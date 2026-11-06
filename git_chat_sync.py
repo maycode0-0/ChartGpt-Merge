@@ -74,6 +74,11 @@ def gui_settings(value):
     for key in ("project_ids", "thread_ids"):
         if isinstance(value.get(key), list):
             result[key] = sorted({v for v in value[key] if isinstance(v, str)})
+    if isinstance(value.get("path_mappings"), dict):
+        try:
+            result["path_mappings"] = core.normalize_path_mappings(value["path_mappings"])
+        except core.MergeError:
+            result["path_mappings"] = {}
     return result
 
 

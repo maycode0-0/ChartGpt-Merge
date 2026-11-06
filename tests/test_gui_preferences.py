@@ -241,6 +241,30 @@ class GuiPreferencesTests(unittest.TestCase):
             self.assertTrue(app.project_tree.item("p0t0", "text").startswith("☑"))
         self.launch([check])
 
+    def test_project_directory_dialog_prefills_local_path_and_remembers_edits(self):
+        from tkinter import ttk
+        job = self.path.parent / "merge"
+        core.write_json(job / "report.json", {"status": "ready", "conflicts": []})
+        source, target = r"D:\Office\Project", r"E:\Home\Project"
+        def catalog(path):
+            return [{"name": "Project", "roots": [source if Path(path).name == "incoming" else target]}]
+        with mock.patch.object(core, "project_catalog", side_effect=catalog), mock.patch.object(ui.ChatMergeApp, "_merge") as merge:
+            def edit(root):
+                root.chat_app._show_review(job)
+                self.button(root, "修改项目目录…").invoke()
+                tree = next(w for w in self.widgets(root) if isinstance(w, ttk.Treeview) and tuple(w.cget("columns")) == ("source", "target"))
+                self.assertEqual(tree.item("0", "values"), (source, target))
+                dialog = tree.winfo_toplevel()
+                entry = next(w for w in self.widgets(dialog) if isinstance(w, ttk.Entry))
+                root.setvar(entry.cget("textvariable"), r"F:\Personal\Project")
+                self.button(root, "按此目录重新合并").invoke()
+            def check(root):
+                merge.assert_called_once()
+                self.assertEqual(merge.call_args.args[:2], (job / "base", job / "incoming"))
+                self.assertEqual(root.chat_app.path_mappings, {source: r"F:\Personal\Project"})
+            self.launch([edit, check])
+        self.assertEqual(sync.load_settings()["gui"]["path_mappings"], {source: r"F:\Personal\Project"})
+
 
 if __name__ == "__main__":
     unittest.main()

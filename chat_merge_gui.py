@@ -41,6 +41,7 @@ class ChatMergeApp:
         self.busy = False
         self.job = None
         self.report = {}
+        self.path_mappings = saved.get("path_mappings", {})
         self.events = queue.Queue()
         self.buttons, self.editors = [], []
         self.pending_save = self.poll_id = self.startup_id = None
@@ -145,6 +146,9 @@ class ChatMergeApp:
         self._button(row, "打开备份目录", lambda: self.open_path(self.job), enabled=lambda: bool(self.job), side="left")
         self._button(row, "重新选择冲突版本", self.resolve_conflict,
                      enabled=lambda: bool(self.report.get("conflicts")), side="right")
+        self._button(self.review, "修改项目目录…", self.edit_project_directories,
+                     enabled=lambda: bool(self.job) and self.report.get("status") != "applied",
+                     anchor="w", pady=(10, 0))
         self.review_details = tk.Text(self.review, height=12, wrap="word", state="disabled", relief="flat",
                                       background="#ffffff", font=("Microsoft YaHei UI", 10))
         self.review_details.pack(fill="both", expand=True, pady=(18, 0))
@@ -309,7 +313,8 @@ class ChatMergeApp:
         page = next((k for k, v in self.pages.items() if str(v) == self.tabs.select()), "git")
         cfg["gui"] = {k: v.get().strip() for k, v in self.values.items()}
         cfg["gui"].update(conflict=self.choice.get(), scope=self.scope.get(), selection_home=self.selection_home,
-                          project_ids=sorted(self.checked_projects), thread_ids=sorted(self.checked_threads), page=page)
+                          project_ids=sorted(self.checked_projects), thread_ids=sorted(self.checked_threads), page=page,
+                          path_mappings=self.path_mappings)
         try:
             sync.save_settings(cfg)
             return True
@@ -613,7 +618,8 @@ class ChatMergeApp:
     def _merge(self, base, incoming, values, policy):
         job = Path(values["work"]) / ("merge-" + core.stamp())
         try:
-            result = core.merge_snapshots(base, incoming, job, values["home"], policy, self.log)
+            options = {"path_mappings": dict(self.path_mappings)} if self.path_mappings else {}
+            result = core.merge_snapshots(base, incoming, job, values["home"], policy, self.log, **options)
         except Exception:
             if (job / "report.json").exists():
                 self.events.put(("review", job))
@@ -671,6 +677,10 @@ class ChatMergeApp:
         self.review_summary.set(summary + ("　尚未写入，确认后点击「应用到本机」。" if ready else "　合并未完成，请查看报告；分叉时可重新选择显示版本。"))
         details = [f"目标聊天目录：{self.report.get('target_home', '')}", f"双方备份与报告：{self.job}", "",
                    f"保留聊天：{len(self.report.get('kept_threads', []))}", ""]
+        if self.report.get("path_mappings"):
+            details.append("项目目录映射（只处理来源电脑的目录）：")
+            details.extend(f"• {source} → {target}" for source, target in self.report["path_mappings"].items())
+            details.append("")
         if self.report.get("conflicts"):
             details.append("分别续聊的聊天：")
             for conflict in self.report["conflicts"]:
@@ -694,6 +704,109 @@ class ChatMergeApp:
                 self._show_review(Path(path).parent)
             except (OSError, ValueError) as e:
                 self._error("无法读取合并报告：" + str(e))
+
+    def edit_project_directories(self):
+        previous = self.job
+        if not previous:
+            return
+        try:
+            source_groups = core.project_catalog(previous / "incoming")
+            local_groups = core.project_catalog(previous / "base")
+            entries, seen = [], set()
+            existing = dict(self.path_mappings)
+            existing.update(self.report.get("path_mappings", {}))
+            existing = core.normalize_path_mappings(existing)
+            for project in source_groups:
+                candidates = [p for p in local_groups if p["name"] == project["name"] and len(p["roots"]) == 1]
+                for source in project["roots"]:
+                    key = core.normalized_root(source)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    target = core.mapped_project_path(source, existing)
+                    if target == source and len(project["roots"]) == 1 and len(candidates) == 1:
+                        target = candidates[0]["roots"][0]
+                    entries.append((project["name"], source, target))
+            # Chats without project roots can still have a working directory.
+            if not entries:
+                with core.database(previous / "incoming" / core.discover(previous / "incoming")["state"]) as db:
+                    for row in db.execute("SELECT DISTINCT cwd FROM threads ORDER BY cwd"):
+                        if row[0]:
+                            entries.append(("聊天工作目录", row[0], core.mapped_project_path(row[0], existing)))
+        except (OSError, ValueError, core.MergeError) as e:
+            self._error("无法读取快照中的项目目录：" + str(e))
+            return
+        if not entries:
+            self._error("来源快照中没有可修改的项目目录或聊天工作目录。")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("修改项目目录")
+        dialog.geometry("940x540")
+        dialog.minsize(800, 440)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        frame = ttk.Frame(dialog, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="把来源电脑的项目目录映射到本机。子目录随之转换，项目文件不会移动。",
+                  wraplength=850).pack(anchor="w")
+        ttk.Label(frame, text="同名且唯一的本机项目会预填目录；确认后重新生成合并预览。",
+                  foreground="#58677d").pack(anchor="w", pady=(6, 12))
+        table_frame = ttk.Frame(frame)
+        table_frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(table_frame, columns=("source", "target"), show="tree headings", selectmode="browse", height=6)
+        for column, label, width in (("#0", "项目", 160), ("source", "来源电脑目录", 340), ("target", "本机目录", 340)):
+            tree.heading(column, text=label)
+            tree.column(column, width=width, minwidth=100)
+        scroll = ttk.Scrollbar(table_frame, command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        for number, (name, source, target) in enumerate(entries):
+            tree.insert("", "end", iid=str(number), text=name, values=(source, target))
+        target_var, current = tk.StringVar(), [None]
+        def select(_=None):
+            selected = tree.selection()
+            current[0] = selected[0] if selected else None
+            if current[0] is not None:
+                target_var.set(tree.item(current[0], "values")[1])
+        def update(*_):
+            if current[0] is not None:
+                source = tree.item(current[0], "values")[0]
+                tree.item(current[0], values=(source, target_var.get()))
+        target_var.trace_add("write", update)
+        tree.bind("<<TreeviewSelect>>", select)
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(14, 8))
+        ttk.Label(row, text="选中项目的本机目录").pack(side="left", padx=(0, 10))
+        ttk.Entry(row, textvariable=target_var).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="选择文件夹", command=lambda: self._browse(target_var)).pack(side="left", padx=8)
+        def keep_original():
+            if current[0] is not None:
+                target_var.set(tree.item(current[0], "values")[0])
+        ttk.Button(row, text="保持原目录", command=keep_original).pack(side="left")
+        row = ttk.Frame(frame)
+        row.pack(fill="x", pady=(10, 0))
+        def confirm():
+            mappings = dict(self.path_mappings)
+            for node in tree.get_children():
+                source, target = tree.item(node, "values")
+                mappings = {k: v for k, v in mappings.items() if core.normalized_root(k) != core.normalized_root(source)}
+                mappings[source] = target
+            try:
+                mappings = core.normalize_path_mappings(mappings)
+            except core.MergeError as e:
+                messagebox.showerror("目录不完整", str(e), parent=dialog)
+                return
+            self.path_mappings = mappings
+            self._changed()
+            values, policy = self._capture(), self.choice.get()
+            dialog.destroy()
+            self._reset_review()
+            self.run("按本机目录重新合并", lambda: self._merge(previous / "base", previous / "incoming", values, policy))
+        ttk.Button(row, text="取消", command=dialog.destroy).pack(side="right")
+        ttk.Button(row, text="按此目录重新合并", command=confirm, style="Primary.TButton").pack(side="right", padx=8)
+        tree.selection_set("0")
+        select()
 
     def resolve_conflict(self):
         dialog = tk.Toplevel(self.root)

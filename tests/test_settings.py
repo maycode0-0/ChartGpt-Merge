@@ -19,6 +19,7 @@ class SettingsTests(unittest.TestCase):
         gui = {"home": "D:/配置/.codex", "incoming": "D:/other", "work": "D:/backups",
                "result": "D:/merged", "conflict": "base", "scope": "selected",
                "selection_home": "D:/配置/.codex", "project_ids": ["p1"], "thread_ids": ["t1"],
+               "path_mappings": {r"D:\Office\Project": r"E:\Home\Project"},
                "password": "nested-secret"}
         sync.save_settings({"gui": gui, "password": "outer-secret"}, self.path)
         sync.save_settings({"url": "git@github.com:example/chats.git", "encrypt": False}, self.path)
