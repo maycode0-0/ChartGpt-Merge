@@ -1,3 +1,12 @@
+CREATE TABLE active_chat_turns (
+      profile TEXT NOT NULL,
+      account_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      launch_id TEXT NOT NULL,
+      observed_at_ms INTEGER NOT NULL,
+      PRIMARY KEY (profile, account_id, user_id, thread_id)
+    ) WITHOUT ROWID;
 CREATE TABLE automation_runs (
           thread_id TEXT PRIMARY KEY,
           automation_id TEXT NOT NULL,

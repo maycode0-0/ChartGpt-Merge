@@ -43,6 +43,9 @@ class ProjectExportTests(unittest.TestCase):
                 m.insert(c, "local_thread_catalog", dict(host_id="local-a", thread_id=tid, display_title=tid,
                          source_created_at=1, source_updated_at=2, cwd=r"D:\Projects\b", source_kind="local", observation_sequence=1))
             c.execute("UPDATE automations SET prompt='UNSELECTED_AUTOMATION_SECRET'")
+            c.executemany("INSERT INTO active_chat_turns VALUES (?,?,?,?,?,?)", [
+                ("profile", "UNSELECTED_RUNTIME_ACCOUNT", "user", tid, "launch", 1)
+                for tid in ("a1", "b1")])
         m.write_json(self.home / m.GLOBAL, {
             "local-projects": {
                 "legacy-a": {"id": "legacy-a", "name": "Project A", "rootPaths": [r"D:\Projects\a"]},
@@ -96,6 +99,7 @@ class ProjectExportTests(unittest.TestCase):
             self.assertEqual({r[0] for r in c.execute("SELECT DISTINCT thread_id FROM thread_items")}, {"a1", "a2", "directory-a"})
         with m.database(output / "sqlite/codex.db") as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM automations").fetchone()[0], 0)
+            self.assertEqual(c.execute("SELECT COUNT(*) FROM active_chat_turns").fetchone()[0], 0)
             self.assertEqual({r[0] for r in c.execute("SELECT thread_id FROM local_thread_catalog")}, {"a1", "a2", "directory-a"})
         g = m.read_json(output / m.GLOBAL)
         self.assertEqual(set(g["local-projects"]), {"legacy-a"})
@@ -123,6 +127,13 @@ class ProjectExportTests(unittest.TestCase):
             with self.assertRaises(m.MergeError):
                 self.export("invalid" + str(number), **args)
             self.assertFalse((self.root / ("invalid" + str(number)) / "manifest.json").exists())
+
+    def test_unknown_app_table_still_blocks_project_export(self):
+        with m.database(self.home / "sqlite/codex.db", True) as c:
+            c.execute("CREATE TABLE future_app_table (thread_id TEXT)")
+        with self.assertRaisesRegex(m.MergeError, r"sqlite/codex\.db.*future_app_table"):
+            self.export(project_ids=["legacy-a"])
+        self.assertFalse((self.root / "selected" / "manifest.json").exists())
 
     def test_deleted_private_rows_do_not_leak_in_fresh_database(self):
         with m.database(self.home / "thread_history_1.sqlite", True) as c:

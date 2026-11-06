@@ -679,9 +679,11 @@ def export_selected(home, output, dbs, project_ids, thread_ids, log, *, _check_c
                 known = {"codex_schema_migrations", "local_thread_catalog_hosts", "local_thread_catalog_metadata",
                          "local_thread_catalog", "thread_timeline_ledger", "inbox_items", "automations", "automation_runs",
                          "local_app_server_feature_enablement", "local_thread_catalog_sync_state", "local_thread_catalog_scan_checkpoints",
-                         "local_thread_catalog_scan_entries", "live_visualization_suggestions"}
-                if tables(a) - known:
-                    raise MergeError("应用数据库新增未支持的表，无法安全按项目导出")
+                         "local_thread_catalog_scan_entries", "live_visualization_suggestions", "active_chat_turns"}
+                unknown = tables(a) - known
+                if unknown:
+                    raise MergeError(f"应用数据库 {rel} 新增未支持的表，无法安全按项目导出：{', '.join(sorted(unknown))}")
+            # Keep active_chat_turns in the schema, but never export its app runtime rows.
             subset_database(home / rel, output / rel, {
                 "codex_schema_migrations": None, "local_thread_catalog_metadata": None,
                 "local_thread_catalog_hosts": ("host_id", local_hosts),
