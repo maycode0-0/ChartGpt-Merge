@@ -1,0 +1,2 @@
+# Optional for encrypted Git backups. Local merge itself uses the standard library.
+cryptography>=42

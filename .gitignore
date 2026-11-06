@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+dist/
+build/
+*.spec
+exports/
+backups/
+export-*/
+local-*/
+download-*/
+merge-*/
+rollback-*/
+git-repo/
+
+# Run directly from source; generated distribution archives are not tracked.
+/*.zip
